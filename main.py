@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import yfinance as yf
 import numpy as np
@@ -8,6 +8,8 @@ from sklearn.preprocessing import StandardScaler
 from tensorflow.keras.models import load_model
 from datetime import time, datetime, timedelta
 import pytz
+from pydantic import BaseModel
+from typing import List
 
 app = FastAPI()
 
@@ -26,6 +28,11 @@ with open("viet_label_encoder.pkl", "rb") as f:
     label_encoder = pickle.load(f)
 with open("trained_tickers.pkl", "rb") as f:
     trained_tickers = pickle.load(f)
+
+# Định nghĩa model cho dữ liệu lịch sử từ frontend
+class HistoryData(BaseModel):
+    datetime: List[str]
+    close: List[float]
 
 # ---------- Hàm xử lý ----------
 def get_latest_5_days(ticker, interval="1m"):
@@ -47,7 +54,6 @@ def preprocess_for_prediction_new_scaler(df, ticker, label_encoder, window_size=
     close_values = df["close"].values
     if len(close_values) < window_size:
         raise ValueError(f"Expected at least {window_size} records, got {len(close_values)}.")
-    # scaler.fit(close_values.reshape(-1, 1))
     scaler.fit(close_values[-61:].reshape(-1, 1))
     normalized_values = scaler.transform(close_values[-window_size:].reshape(-1, 1)).flatten()
     X_price = normalized_values.reshape(1, window_size, 1)
@@ -88,8 +94,7 @@ async def predict_ticker(ticker: str, type: str = "next_minute"):
         elif type == "4_minutes":
             window_size = 64
         else:
-            window_size = 65  # fallback
-
+            window_size = 65
 
         df_last_n = df.tail(window_size)
 
@@ -124,8 +129,6 @@ async def predict_ticker(ticker: str, type: str = "next_minute"):
             response["second_predicted_price"] = round(float(pred_original_2), 4)
         elif type in ["3_minutes", "4_minutes"]:
             minutes = 3 if type == "3_minutes" else 4
-
-
             df_extended = df_last_n.copy()
             predicted_prices = [pred_original]
             for _ in range(minutes - 1):
@@ -140,3 +143,72 @@ async def predict_ticker(ticker: str, type: str = "next_minute"):
         return response
     except Exception as e:
         return {"error": str(e)}
+
+@app.post("/predict_custom/{ticker}")
+async def predict_custom(ticker: str, history: HistoryData, type: str = "next_minute"):
+    ticker = ticker.upper()
+    if ticker not in trained_tickers:
+        raise HTTPException(status_code=400, detail=f"Ticker {ticker} chưa được huấn luyện.")
+    try:
+        # Chuyển dữ liệu lịch sử thành DataFrame
+        df = pd.DataFrame({
+            "datetime": pd.to_datetime(history.datetime),
+            "close": history.close,
+            "ticker": ticker
+        })
+        df = df.dropna(subset=["close"])
+        
+        if type == "next_minute":
+            window_size = 61
+        elif type == "two_minutes":
+            window_size = 62
+        elif type == "3_minutes":
+            window_size = 63
+        elif type == "4_minutes":
+            window_size = 64
+        else:
+            window_size = 65
+
+        if len(df) < window_size:
+            raise HTTPException(status_code=400, detail=f"Expected at least {window_size} records, got {len(df)}.")
+
+        df_last_n = df.tail(window_size)
+        X_price, X_ticker, scaler = preprocess_for_prediction_new_scaler(df_last_n, ticker, label_encoder)
+
+        pred_normalized = model.predict({"price_input": X_price, "ticker_input": X_ticker}, verbose=0)
+        pred_original = scaler.inverse_transform(pred_normalized)[0][0]
+        actual_price = float(df_last_n["close"].iloc[-1])
+        error_value = abs(pred_original - actual_price)
+
+        response = {
+            "ticker": ticker,
+            "predicted_price": round(float(pred_original), 4),
+            "actual_price": round(float(actual_price), 4),
+            "error": round(float(error_value), 4),
+            "next_day_prediction": False
+        }
+
+        if type == "two_minutes":
+            df_extended = df_last_n.copy()
+            df_extended.loc[df_last_n.index[-1] + 1, "close"] = pred_original
+            df_extended = df_extended.tail(60)
+            X_price_2, X_ticker_2, scaler_2 = preprocess_for_prediction_new_scaler(df_extended, ticker, label_encoder)
+            pred_normalized_2 = model.predict({"price_input": X_price_2, "ticker_input": X_ticker_2}, verbose=0)
+            pred_original_2 = scaler_2.inverse_transform(pred_normalized_2)[0][0]
+            response["second_predicted_price"] = round(float(pred_original_2), 4)
+        elif type in ["3_minutes", "4_minutes"]:
+            minutes = 3 if type == "3_minutes" else 4
+            df_extended = df_last_n.copy()
+            predicted_prices = [pred_original]
+            for _ in range(minutes - 1):
+                df_extended.loc[df_extended.index[-1] + 1, "close"] = predicted_prices[-1]
+                df_extended = df_extended.tail(60)
+                X_price_n, X_ticker_n, scaler_n = preprocess_for_prediction_new_scaler(df_extended, ticker, label_encoder)
+                pred_normalized_n = model.predict({"price_input": X_price_n, "ticker_input": X_ticker_n}, verbose=0)
+                pred_original_n = scaler_n.inverse_transform(pred_normalized_n)[0][0]
+                predicted_prices.append(pred_original_n)
+            response["extended_predicted_prices"] = [round(float(p), 4) for p in predicted_prices]
+
+        return response
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
