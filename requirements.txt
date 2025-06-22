@@ -1,8 +1,9 @@
 fastapi
 uvicorn
-pandas
+yfinance
 numpy
+pandas
 scikit-learn
 tensorflow
-yfinance
 pytz
+pydantic
